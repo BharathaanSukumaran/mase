@@ -198,7 +198,7 @@ def get_objective(layer_choices):
 
 `LinearBlockMinifloat` and `LinearBinaryResidualSign` do not define a backward pass so we cannot retrain the model if any of those layers are present.
 
-The final stage is to loop through a set of trials and record the best value from each study.
+5. Loop through a set of trials and record the best value from each study.
 ```py
 N_TRIALS = 24
 
@@ -228,6 +228,10 @@ def run_comparison():
     plt.show()
 ```
 
+6. Apply MASE's compression pass to apply the best hyperparameters to integer quantization from task 1. We also apply pruning, a method for reducing model size and complexity by removing random weights and structural components.  
+
+
+
 ### Results
 
 ![](images/tutorial6_task1_integer_layerwise_running_best.png)
@@ -235,6 +239,13 @@ def run_comparison():
 
 ![](images/tutorial6_task2_all_precisions_running_best.png)
 *Increasing number of trials per study for parameter search over multiple precision layers*
+
+For pruning, we apply integer quantization using the best hyperparameters from Optuna's search, and use a pruning configuration as follows
+- *sparsity*: 0.5
+- *method*: l1-norm
+- *scope*: local
+
+We analyse 2 variants of the compressed model, one that is post-trained and one that is not. We observed an accuracy of 0.502 without post-training, and one of 0.862096 with post-training.
 
 ### Observations
 
@@ -275,7 +286,7 @@ The next best performers are the `LinearBinaryScaling` and `LinearBinary` layers
 
 With these precisions, we perform Quantization-aware training, allowing the model to adapt to the weights being only within the [-1,1] range.
 
-The best performers are the `LinearBlockLog`, `LinearBlockFP`, `LinearLog`, `LinearMinifloatDenorm`, `LinearMinifloatIEEE` and `LinearInteger` layers. 
+The best performers are the `LinearBlockLog`, `LinearBlockFP`, `LinearLog`, `LinearMinifloatDenorm`, `LinearMinifloatIEEE` and `LinearInteger` layers.
 
 ### Conclusion
 
@@ -287,9 +298,11 @@ The best performers are so, even with `n_trials = 1`, because my search includes
 
 Moreover, these precisions preserve the algebraic properties of the original model, and preserve sign and magnitude. In comparison with the `LinearBinary` layer, a weight of 0.0001 and 5.0 both become 1.0 post quantization. The magnitude information has been lost.
 
+Finally, we see the usefulness of post-training as shown by the compression results. Quantization and pruning is lossy, pre-training allows the model to adapt the model's weights to the new quantization scheme and structure imposed after quantization and pruning.
+
 ### Key Takeaways
 
-Quantization is a process that allows model sizes to reduce, allowing for more efficient inference. The tradeoff is accuracy, but through principled techniques like QAT, we can regain the lost information, sometimes even  surpursing the accuracy of the base model. Additinally, the hyperparameters chosen for any layer affect the performace, because they relate to how well the layer retains information. One can also pick precisions such that we effectively get a compression that doesn't loose much of the information compared to the full-precision model.
+Quantization is a process that allows model sizes to reduce, allowing for more efficient inference. This process is lossy, but through principled techniques like QAT and post-training, we can regain the lost information, sometimes even  surpursing the accuracy of the base model. Additinally, the hyperparameters chosen for any layer affect the performace, because they relate to how well the layer retains information. One can also pick precisions such that we effectively get a compression that doesn't loose much of the information compared to the full-precision model.
 
 ---
 

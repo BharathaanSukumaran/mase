@@ -495,7 +495,7 @@ So each CTA loads the **BLK_K shared exponents** corresponding to the group colu
 
 ---
 
-## Q3.3 — How does `layout_sX` partition threads for computation? (`local_partition`)
+## Q3.3 — How does `layout_tX` partition threads for computation? (`local_partition`)
 
 Threads are arranged using:
 
@@ -545,3 +545,85 @@ auto exp = static_cast<uint16_t>(sScale[scaleIdx]) << 7;
 ```
 
 Since `size<0>(layout_tX) == BLK_M`, dividing by `BLK_M` effectively groups threads by **K column**, so all `m` rows within the same column use the same shared exponent — matching the MXINT grouping semantics.
+
+---
+
+## Q4 — MXINT8 Dequantization Kernel: Latency Profiling and Real Memory Savings
+
+This section reports the empirical results from:
+1) profiling `dequantize1d` latency (CPU vs GPU), and  
+2) compressing a real Transformer model using `QLinearPacked` to measure **actual GPU memory savings**.
+
+---
+
+### Q4.1 — Latency Profiling: CPU vs GPU Dequantization
+
+We used the provided pytest benchmark (`test_ext_dequantize1d_latency`) to compare the host reference implementation against the CUDA kernel. The benchmark sweeps:
+- `m` (number of elements)
+- `group_size` (MXINT group size)
+
+A key pattern is that GPU dequantization only becomes advantageous once the input size is large enough to amortize kernel launch overhead.
+
+**Observed behaviour:**
+- For small tensors (e.g., `m=1024`), GPU is slower than CPU due to launch/synchronization overhead (speedup < 1×).
+- For moderate to large tensors (`m ≥ 2,097,152`), GPU becomes substantially faster (tens of × faster), indicating the kernel is throughput-bound and benefits from high device memory bandwidth.
+
+**Takeaway:**
+> The dequantization kernel is dominated by memory throughput rather than arithmetic complexity. Once `m` is sufficiently large, GPU execution amortizes launch overhead and achieves significant speedups relative to the CPU implementation. Group size has a smaller, secondary effect because the kernel remains mostly memory-bandwidth bound.
+
+---
+
+### Q4.2 — Saved GPU Memory: FP32 vs MXINT8 in a Real Model
+
+We then replaced linear layers in a sentiment/emotion classification Transformer with `mase_cuda.mxint8.linear.QLinearPacked` and measured peak GPU memory during inference.
+
+**Environment and model:**
+- GPU: NVIDIA GeForce RTX 2050 (4GB)
+- Model: `AnkitAI/deberta-v3-small-base-emotions-classifier` (chosen due to VRAM limits)
+
+**Measured peak memory:**
+- FP32 model peak memory: **559.9395 MB**
+- MXINT8 model peak memory: **445.4985 MB**
+
+This corresponds to an observed reduction of:
+
+\[
+\frac{559.9395 - 445.4985}{559.9395} \approx 0.204 \quad\Rightarrow\quad \textbf{20.4\% saved}
+\]
+
+**Numerical validity check:**
+Both models produced the same predicted label (`joy`) and very similar top-3 logits, showing that MXINT8 compression did not materially change the output for this example.
+
+---
+
+### Q4.3 — Why is the saved GPU memory not exactly 74.2%?
+
+The theoretical savings often cited for MXINT8 weight storage,
+
+\[
+\frac{32 - (8 + 8/32)}{32} = 74.2\%
+\]
+
+assumes an idealized setting where:
+1. **All model memory is dominated by FP32 weights**, and  
+2. **All weights are replaced** by MXINT8 storage with no overhead, and  
+3. There are no additional runtime allocations affecting peak memory.
+
+In a real Transformer inference run, these assumptions do not hold. The observed savings are lower because:
+
+1. **Activations and intermediate tensors remain high precision.**  
+   Even in `eval()` and `torch.no_grad()`, inference allocates memory for embeddings, attention intermediates, and MLP activations. These are not reduced by weight-only quantization.
+
+2. **Not all parameters are quantized.**  
+   The conversion loop targets `torch.nn.Linear` modules and may exclude layers such as embeddings, LayerNorms, biases, and the classifier head. Any unquantized layers remain FP32.
+
+3. **MXINT introduces real storage overhead.**  
+   MXINT requires storing **shared exponents** (`uint8` per group) and uses packed layouts, which may include padding/alignment overhead.
+
+4. **PyTorch CUDA allocator behaviour affects peak memory.**  
+   Peak memory reflects allocator reservations, caching, and fragmentation, not just the raw tensor sizes. Therefore, peak allocated memory does not scale linearly with parameter size reduction.
+
+**Answer:**
+> The theoretical 74.2% reduction is an upper bound for weight storage in isolation. In practice, peak GPU memory includes activations, unquantized layers, exponent/storage overheads, and allocator effects; therefore the measured reduction (≈20%) is expected and still demonstrates meaningful memory savings without changing the final prediction.
+
+---

@@ -842,7 +842,7 @@ implicit leading bit. To extend the representable signed magnitude range using l
 mantissa bits, MXINT uses the second most significant magnitude bit (the `0x40` bit)
 as a *region selector*.
 
-Let $( r = |m| \,\&\, 0x40 )$. The kernel applies one of two decoding rules:
+Let $`( r = |m| \,\&\, 0x40 )`$. The kernel applies one of two decoding rules:
 
 $$
 y =

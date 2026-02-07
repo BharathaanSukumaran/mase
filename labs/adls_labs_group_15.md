@@ -20,11 +20,17 @@
 
 ## Lab 1 – Quantisation and Pruning Fundamentals
 
-### Setup
+### Overview
+We investigate how we can make our models more efficient by quantising and pruning. These are common compression techniques used to reduce memory and compute costs. <br>
+- Quantisation reduces the numerical precision used to represent weights and activations. 
+- Sparsity refers to the number of model parameters that are set to zero and so do not contribute to computation.
 
-### Results
+### Quantisation
+We focus on fixed-point quantisation in this lab. This is where floating-point weights and activations are represented using a limited number of bits. We compare Post-Training Quantisation (PTQ) and Quantisation-Aware Training (QAT). PTQ applies quantisation after training without modifying the model. QAT is when quantisation effects are simulated during training to allow the model to adapt. We sweep bit-widths from 4 to 32 showing how reduced precision degrades accuracy and how QAT can recover performance at lower bit-widths compared to PTQ. <br>
 
-### Observations
+Our workflow is
+
+### Pruning
 
 ### Conclusion
 

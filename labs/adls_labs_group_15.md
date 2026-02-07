@@ -921,17 +921,17 @@ The MXINT8 dequantisation kernel implements a weight-only quantisation workflow 
 persistent model weights are stored in a compact MXINT8 representation and expanded only
 when required for computation.
 
-The kernel proceeds as follows:
+The kernel executes the following steps:
 
 1. MXINT8 mantissas (`int8`) and shared micro-exponents (`uint8`) are loaded from global memory.
 2. Each mantissa is dequantised in-kernel by reconstructing a BFloat16 (BF16) value using
-   bit-level packing and a small correction step.
+   explicit bit-level assembly and a small correction step.
 3. The reconstructed BF16 values are written to global memory for subsequent computation
-   (e.g., GEMM).
+   (e.g. GEMM).
 
 This design reduces persistent GPU memory usage by storing weights in MXINT8 while
-retaining higher-precision arithmetic during computation. After the layer finishes,
-the temporary BF16 weights can be discarded.
+retaining higher-precision arithmetic during execution. After the layer completes, the
+temporary BF16 weights can be discarded.
 
 ---
 
@@ -940,94 +940,84 @@ the temporary BF16 weights can be discarded.
 Dequantisation reconstructs a BF16 value by explicitly assembling its bit fields:
 
 - The sign bit is derived from the MXINT mantissa sign.
-- The exponent field is taken from the shared micro-exponent for the group.
+- The exponent field is taken from the shared micro-exponent of the group.
 - The fraction field is constructed from the lower bits of the mantissa magnitude.
 
-Let $( m \in \{-128, \dots, 127\} )$ denote the MXINT mantissa and
-\( e \) the shared micro-exponent. Define:
+Let \( m \in \{-128, \dots, 127\} \) denote the MXINT mantissa and let \( e \) denote the
+shared micro-exponent. The packed BF16 value is formed as
 
-$$
-\text{out} = \text{BF16}( \text{sign}(m),\ e,\ \text{frac}(|m|) )
-$$
+\[
+\text{out} = \text{BF16}\bigl(\text{sign}(m),\ e,\ \text{frac}(|m|)\bigr).
+\]
 
 MXINT mantissas are not IEEE-normalised floating-point numbers and do not include an
 implicit leading bit. To extend the representable signed magnitude range using limited
-mantissa bits, MXINT uses the second most significant magnitude bit (the `0x40` bit)
+mantissa bits, MXINT uses the second most significant magnitude bit (hex value `0x40`)
 as a *region selector*.
 
-Let $`( r = |m| \,\&\, 0x40 )`$. The kernel applies one of two decoding rules:
+Define the region selector as \( r = |m| \,\&\, 0x40 \). The kernel applies one of two
+decoding rules:
 
-$`
+\[
 y =
 \begin{cases}
-\text{out}, & r \neq 0 \\
-\text{out} - \text{bias}, & r = 0
+\text{out}, & r \neq 0, \\
+\text{out} - \text{bias}, & r = 0,
 \end{cases}
-`
-$
+\]
 
-where:
+where
 
-$`
-\text{bias} = \text{BF16}(\text{sign}(m),\ e,\ 0)
-`$
+\[
+\text{bias} = \text{BF16}\bigl(\text{sign}(m),\ e,\ 0\bigr).
+\]
 
-Intuitively:
-- If the region selector bit is set, the packed BF16 value already represents the
-  intended magnitude.
-- If it is not set, the value must be offset by a baseline corresponding to the
-  exponent bucket.
+If the region selector bit is set, the packed BF16 value already represents the intended
+magnitude. If it is not set, the value must be offset by a baseline corresponding to the
+exponent bucket. The boolean predicate `dont_need_abs` (or equivalently
+`dont_need_bias`) selects between these two cases.
 
-The boolean predicate `dont_need_abs` (or equivalently `dont_need_bias`) selects between
-these two cases. This mechanism increases effective dynamic range without increasing
-mantissa width.
+This mechanism increases effective dynamic range without increasing mantissa width.
 
 ---
+
 #### Question: How does `cta_tiler` partition the data for copy?
+
 ##### CTA-Level Tiling with `cta_tiler` (CuTe `local_tile`)
 
-After reshaping, the MXINT mantissas are treated as a logical 2D tensor of shape:
+After reshaping, the MXINT mantissas are treated as a logical two-dimensional tensor with
+dimensions
 
-$`
-(M, K) = (\text{group\_size},\ \text{num\_groups})
-`
-$
+\[
+(M, K),
+\]
 
-where:
-- the row dimension indexes elements within a group, and
-- the column dimension indexes groups (and shared exponents).
+where \( M \) indexes elements within a group and \( K \) indexes groups (and shared
+micro-exponents).
 
-The kernel partitions this tensor across CTAs using a tiler:
+The kernel partitions this tensor across CTAs using the tiler `cta_tiler`, which has shape
 
-$\text{cta\_tiler} = (\text{BLK\_M}, \text{BLK\_K})$
+\[
+(\text{BLK\_M}, \text{BLK\_K}).
+\]
 
-with CTA coordinates:
+Each CTA is identified by coordinates
 
-$$
-\text{cta\_coord} = (\text{blockIdx.x},\ \text{blockIdx.y})
-$$
+\[
+(\text{blockIdx.x},\ \text{blockIdx.y}).
+\]
 
-Applying `local_tile` selects the rectangular sub-tensor owned by each CTA:
+Applying `local_tile` selects the rectangular sub-tensor owned by each CTA. The global
+tensor is therefore decomposed into independent tiles of size
+\( \text{BLK\_M} \times \text{BLK\_K} \), with each CTA responsible for one such tile. The
+output tensor is tiled identically.
 
-- Rows:  
-  $$
-  [\text{blockIdx.x} \cdot \text{BLK\_M},\ \dots]
-  $$
-- Columns:  
-  $$
-  [\text{blockIdx.y} \cdot \text{BLK\_K},\ \dots]
-  $$
+The shared exponent vector is tiled only along the group dimension, so each CTA loads
+exactly the micro-exponents required for the columns it processes.
 
-Thus, the global tensor is decomposed into independent
-$((\text{BLK\_M} \times \text{BLK\_K}))$ tiles, each processed by one CTA.
-The output tensor is tiled identically.
-
-The shared exponent vector is tiled only along the group (K) dimension, so each CTA
-loads exactly the exponents required for the columns it processes.
-
-This CTA-level work decomposition is conceptually identical to the CTA tiling used in
-CuTe GEMM kernels: CTAs own disjoint tiles of the output space, while the reduction (or
-streaming) dimension is iterated within the CTA when needed.
+This CTA-level work decomposition mirrors the tiling strategy used in CuTe GEMM kernels,
+where CTAs own disjoint output tiles while iterating over reduction or streaming
+dimensions locally.
 
 <figure>
   <img src="https://docs.nvidia.com/cutlass/latest/_images/tC_partitioning.png"
@@ -1035,41 +1025,33 @@ streaming) dimension is iterated within the CTA when needed.
        width="400"/>
   <figcaption>
     Figure 4.1: CuTe <code>tC</code> thread layout and partitioning. The thread
-    layout defines how the output tile is decomposed across threads, with each
-    thread responsible for a structured sub-tile of the output matrix.
+    layout defines how the output tile is decomposed across threads.
   </figcaption>
 </figure>
 
 ---
-#### Question: How does `layout_tX` partition the threads in a threadblock for computation?
+
+#### Question: How does `layout_tX` partition threads in a threadblock?
+
 ##### Thread-Level Partitioning with `layout_tX` (CuTe `local_partition`)
 
 Within each CTA, CuTe maps threads to elements of the CTA tile using a static thread
-layout:
-
-$$
-\text{layout\_tX} = (\text{THD\_M}, \text{THD\_K})
-$$
-
-with:
-$$
-\text{THD\_M} = \text{BLK\_M}, \quad \text{THD\_K} = \text{BLK\_K}
-$$
-
-This produces $(\text{BLK\_M} \times \text{BLK\_K})$ threads, each corresponding to a
-unique logical $((m, k))$ position in the CTA tile.
+layout denoted by `layout_tX`. This layout assigns one logical \((m, k)\) position to
+each thread within the tile.
 
 Applying `local_partition` yields per-thread views of:
+
 - the global-memory tile,
 - the shared-memory tile, and
 - the output tile.
 
 Each thread:
-- cooperatively loads its assigned element from global memory,
+
+- loads its assigned element from global memory,
 - reconstructs the BF16 value using the shared exponent for its column, and
 - writes the result back to global memory.
 
-This matches CuTe’s copy-partitioning model, where identical partitioning patterns are
+This follows CuTe’s copy-partitioning model, where identical partitioning patterns are
 applied to source and destination tensors to preserve logical correspondence.
 
 <figure>
@@ -1077,12 +1059,10 @@ applied to source and destination tensors to preserve logical correspondence.
        alt="CuTe TiledCopy partitioning"
        width="400"/>
   <figcaption>
-    Figure 4.2: CuTe <code>TiledCopy</code> partitioning for global-to-shared
-    memory copies. Each thread loads a small, contiguous block of elements,
-    enabling vectorised memory accesses and efficient cooperative copying.
+    Figure 4.2: CuTe <code>TiledCopy</code> partitioning for cooperative memory
+    transfers.
   </figcaption>
 </figure>
-
 
 Predication is implemented by partitioning an identity tensor through the same thread
 layout and masking threads whose logical coordinates fall outside valid bounds. This
@@ -1092,25 +1072,22 @@ ensures correctness for partial tiles at tensor boundaries.
 
 #### Compute Mapping and Exponent Reuse
 
-Because threads are laid out across $((m, k))$, all threads sharing the same
-$(k)$-coordinate reuse the same shared micro-exponent. As a result:
+Because threads are laid out across logical \((m, k)\) coordinates, all threads sharing
+the same \( k \)-coordinate reuse the same shared micro-exponent. As a result:
 
-- The exponent is loaded once per group-column.
-- All rows in that column reuse it during reconstruction.
+- the exponent is loaded once per group-column, and
+- all rows in that column reuse it during reconstruction.
 
-This mirrors how CuTe partitions computation in GEMM kernels, where threads operate on
-logical sub-tiles of the output while sharing common operands.
-
+This mirrors CuTe’s computation partitioning in GEMM kernels, where threads operate on
+structured sub-tiles while sharing common operands.
 
 <figure>
   <img src="https://docs.nvidia.com/cutlass/latest/_images/TiledMmaC.png"
        alt="CuTe TiledMMA partitioning"
        width="400"/>
   <figcaption>
-    Figure 4.3: CuTe <code>TiledMMA</code> partitioning. Threads are mapped to
-    fragments of the A, B, and C tensors corresponding to a single MMA
-    instruction, enabling structured accumulation and high arithmetic
-    intensity.
+    Figure 4.3: CuTe <code>TiledMMA</code> partitioning illustrating thread-to-
+    fragment mapping.
   </figcaption>
 </figure>
 
@@ -1124,9 +1101,10 @@ The MXINT8 dequantisation kernel combines:
 - CTA-level tiling via `cta_tiler` and `local_tile`, and
 - thread-level partitioning via `layout_tX` and `local_partition`,
 
-to minimise global memory traffic, maximise exponent reuse, and ensure correct boundary
-handling through predication. This illustrates how numerical format design and GPU
-execution strategy must be co-designed to achieve efficient low-level kernels.
+to minimise global memory traffic, maximise shared exponent reuse, and ensure correct
+boundary handling through predication. This demonstrates how numerical format design and
+GPU execution strategy must be co-designed to achieve efficient low-level kernels.
+
 
 
 ---

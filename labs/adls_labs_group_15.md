@@ -1,20 +1,185 @@
 # ADLS Labs – Group 15
 
----
-
-## Introduction
-
----
-
 ## Lab 0 – Introduction and Environment Setup
 
-### Setup
+### Overview
+
+This lab introduces the MASE framework and establishes the execution environment used throughout the coursework. The goal is to understand how PyTorch models are imported into MASE using Torch FX, how MASE augments FX graphs with semantic metadata, and how different execution configurations affect the captured compute graph.
+
+The lab is divided into two tutorials:
+
+1. **Tutorial 1** focuses on importing a Transformer model into MASE, inspecting the FX graph, and understanding how MASE extends FX with metadata and analysis passes.
+2. **Tutorial 2** explores forward-path sensitivity in HuggingFace models and demonstrates parameter-efficient fine-tuning using **LoRA (Low-Rank Adaptation)**.
+
+Together, these tutorials establish the conceptual foundation for later labs involving graph transformation, quantisation, and custom kernel execution.
+
+---
+
+### Tutorial 1 – Introduction to MASE IR and FX Graphs
+
+#### Objective
+
+Understand how a PyTorch model is symbolically traced using Torch FX, how the resulting compute graph is structured, and how MASE augments FX with semantic metadata to enable principled analysis and transformation passes.
+
+#### FX Graph Capture
+
+Using Torch FX symbolic tracing, the **entire forward pass** of `bert-tiny` is captured as a static compute graph. The graph includes:
+
+```
+
+inputs
+→ embeddings
+→ encoder layers (repeated blocks)
+→ pooler
+→ classifier
+→ output
+
+````
+
+Key properties:
+- The graph is **acyclic** and purely functional.
+- Encoder layers appear as **repeated subgraphs**, which is important for automated optimisation.
+- Dropout layers are present in the graph even during inference, as FX captures executed Python code, not training mode semantics.
+
+#### FX Node Semantics
+
+The graph consists of standard FX node types:
+- `placeholder`: model inputs
+- `call_module`: calls to `nn.Module` instances
+- `call_function`: calls to functional operators
+- `call_method`: tensor method calls
+- `output`: return value of `forward()`
+
+FX preserves **execution structure**, not hardware-level kernels.
+
+#### Why FX Alone Is Insufficient
+
+While FX captures execution structure, it lacks:
+- Explicit ML operator semantics
+- Tensor shape and datatype annotations
+- Hardware or software execution intent
+
+MASE addresses this by attaching metadata to each FX node:
+
+```python
+node.meta["mase"] = {
+  "common": {},
+  "hardware": {},
+  "software": {},
+}
+```
+
+This transforms the FX graph into a **semantic intermediate representation (IR)** suitable for both software and hardware optimisation.
+
+#### Analysis and Transformation Passes
+
+Two passes are demonstrated:
+
+* **Analysis pass**: traverses the graph to count dropout layers without modifying topology.
+* **Transform pass**: removes dropout nodes and rewires the graph using
+  `replace_all_uses_with`, preserving correctness.
+
+This highlights a core MASE principle:
+
+> Analysis passes observe; transform passes modify — but both operate on the same IR.
+
+---
+
+### Tutorial 2 – Forward-Path Sensitivity and LoRA Fine-Tuning
+
+#### Objective
+
+Demonstrate how:
+
+1. HuggingFace forward-path semantics affect FX graph capture, and
+2. LoRA enables parameter-efficient fine-tuning without modifying the base model weights.
+
+#### Forward-Path Sensitivity in HuggingFace Models
+
+HuggingFace models embed **training logic inside `forward()`**. The captured FX graph therefore depends on which inputs are supplied.
+
+Key experiments:
+
+* Supplying `labels` injects a `CrossEntropyLoss` node into the graph.
+* Omitting `labels` produces a **pure inference graph**.
+* Removing `attention_mask` alters attention subgraphs.
+
+This shows that:
+
+* FX captures **executed code paths**, not abstract model structure.
+* Input configuration is a **first-class graph design decision**.
+
+For MASE, this is critical: optimisation and hardware lowering operate on the captured graph, not the model definition.
+
+#### LoRA: Low-Rank Adaptation
+
+The notebook then introduces **LoRA (Low-Rank Adaptation)** as a parameter-efficient fine-tuning method.
+
+Key ideas:
+
+* Instead of updating full weight matrices, LoRA injects **low-rank update matrices** into selected linear layers.
+* The original pretrained weights are frozen.
+* Only a small number of additional parameters are trained.
+
+In practice:
+
+* LoRA adapters are attached to attention and projection layers.
+* Fine-tuning updates only LoRA parameters.
+* The base model remains unchanged.
+
+This is especially relevant for systems work because:
+
+* Memory footprint is reduced.
+* Training communication cost is lower.
+* Fine-tuning becomes feasible on constrained hardware.
+
+#### Systems Perspective
+
+LoRA illustrates an important theme that recurs later in the course:
+
+> Performance and scalability improvements often come from **algorithmic restructuring**, not just faster kernels.
+
+LoRA changes *what is trained*, not *how fast training runs*, yet yields major efficiency gains.
+
+---
 
 ### Results
 
+* Successful FX capture of Transformer models under different execution paths.
+* Verified that:
+
+  * Graph topology changes with input configuration.
+  * Loss computation is embedded inside HuggingFace `forward()`.
+* Demonstrated LoRA fine-tuning with:
+
+  * Frozen base model
+  * Small trainable parameter set
+  * Identical inference graph structure (aside from LoRA injections).
+
+---
+
 ### Observations
 
+* Torch FX is **execution-path sensitive**.
+* MASE provides the semantic layer required to reason about graphs beyond Python execution.
+* Input selection directly affects:
+
+  * Graph topology
+  * Optimisation legality
+  * Hardware mapping
+* LoRA is a powerful example of **systems-aware ML design**, trading parameter redundancy for efficiency.
+
+---
+
 ### Conclusion
+
+Lab 0 establishes the conceptual and technical foundation for the rest of the coursework. By combining FX tracing, MASE’s semantic IR, and LoRA fine-tuning, the lab demonstrates that:
+
+* Deep learning systems must be reasoned about at the **graph and execution level**, not just at the model definition level.
+* Input semantics and execution paths are as important as architecture.
+* Many efficiency gains arise from **restructuring computation**, not accelerating individual operators.
+
+These ideas directly motivate later labs on kernel fusion, quantisation, and custom CUDA kernels.
 
 ---
 
@@ -435,7 +600,7 @@ These design choices follow the recommendations and methodology outlined in the 
 (i) the first few iterations of a compiled model are expected to be slower due to compilation overhead, and
 (ii) speedups are hardware-dependent and may be smaller on non-datacenter GPUs.
 
-Our revised benchmarking functions therefore align with PyTorch’s recommended practice for evaluating `torch.compile`, and avoid misleading conclusions caused by measurement overhead or compilation warm-up effects.
+Our revised benchmarking functions therefore align with PyTorch’s recommended practice for evaluating `torch.compile`, and avoid misleading conclusions caused by measurement overhead or compilation warm-up effects. Runtime is reported as mean per-iteration latency after warm-up.”
 
 
 #### Results
@@ -555,9 +720,9 @@ This structure can be represented as:
 ```
 
 Exp |- Mantissa 1
-|- Mantissa 2
-|- ...
-|- Mantissa (group_size)
+    |- Mantissa 2
+    |- ...
+    |- Mantissa (group_size)
 
 ```
 
@@ -634,110 +799,223 @@ In combination with custom kernels, MXINT8 allows accelerators to achieve high p
 
 ---
 
-## Part D – MXINT8 Dequantisation Kernel
+### Part D – MXINT8 Dequantisation Kernel
 
-### Kernel overview
+#### Kernel Overview
 
-The MXINT8 dequantisation kernel implements a weight-only quantisation workflow in which persistent weights are stored in a compact MXINT8 representation and expanded only when needed:
+The MXINT8 dequantisation kernel implements a weight-only quantisation workflow in which
+persistent model weights are stored in a compact MXINT8 representation and expanded only
+when required for computation.
 
-1. **Load** MXINT8 mantissas (`int8`) and shared micro-exponents (`uint8`) from global memory.
-2. **Dequantise in-kernel** by reconstructing BF16 values using bit-level packing and a small correction step.
-3. **Store** dequantised BF16 weights back to global memory for subsequent computation (e.g., GEMM).
+The kernel proceeds as follows:
 
-This design reduces persistent memory footprint (MXINT8 storage) while retaining higher-precision arithmetic during compute. After the layer finishes, the temporary BF16 weights can be discarded.
+1. MXINT8 mantissas (`int8`) and shared micro-exponents (`uint8`) are loaded from global memory.
+2. Each mantissa is dequantised in-kernel by reconstructing a BFloat16 (BF16) value using
+   bit-level packing and a small correction step.
+3. The reconstructed BF16 values are written to global memory for subsequent computation
+   (e.g., GEMM).
 
----
-
-### Question: Purpose of `dont_need_abs` and `bias`
-
-The host reference implementation (mirrored by the device kernel) reconstructs BF16 values by packing sign, exponent, and fraction fields:
-
-- **Sign bit** comes from the MXINT mantissa sign.
-- **Exponent** comes from the shared micro-exponent (`scale`) for the group.
-- **Fraction** comes from the lower bits of the mantissa magnitude.
-
-A simplified view of the reconstruction logic is:
-
-- `out`: BF16 bit-pattern composed from `(sign | exponent | fraction)`
-- `bias`: BF16 value composed from `(sign | exponent | 0)` (same sign and exponent, zero fraction)
-
-MXINT mantissas are not IEEE-normalised floats and therefore do not have an implicit leading 1. To represent a wider signed magnitude range using limited mantissa bits, MXINT uses a **region selector bit** (the `0x40` bit in the mantissa magnitude). This bit determines which decoding rule should be applied:
-
-- If the region selector bit is set (`mantissa_abs & 0x40 != 0`), the packed value `out` already represents the intended magnitude and can be used directly.
-- If the region selector bit is not set, the packed value must be offset-corrected by subtracting `bias`.
-
-Formally, the kernel implements:
-
-- **Rule A (no correction):** `y = out`
-- **Rule B (offset correction):** `y = out - bias`
-
-Here, `dont_need_abs` (or equivalently `dont_need_bias`) is the predicate selecting between these two decoding rules, and `bias` provides the baseline constant for the exponent bucket. This mechanism increases the effective representable range without increasing mantissa width.
+This design reduces persistent GPU memory usage by storing weights in MXINT8 while
+retaining higher-precision arithmetic during computation. After the layer finishes,
+the temporary BF16 weights can be discarded.
 
 ---
 
-### Question: How does `cta_tiler` partition data for copying? (CUTE `local_tile`)
+#### Bit-Level Reconstruction and Region-Based Decoding
 
-In the CUDA kernel, the 1D mantissa array is reshaped into a logical 2D matrix by grouping elements according to `group_size`:
+Dequantisation reconstructs a BF16 value by explicitly assembling its bit fields:
 
-- Let `M = group_size`
-- Let `K = num_groups`
+- The sign bit is derived from the MXINT mantissa sign.
+- The exponent field is taken from the shared micro-exponent for the group.
+- The fraction field is constructed from the lower bits of the mantissa magnitude.
 
-After flattening, the mantissas are treated as a matrix of shape `(M, K)` where:
-- The **row dimension** corresponds to the element index within a group.
-- The **column dimension** corresponds to the group index (and thus the shared exponent index).
+Let $( m \in \{-128, \dots, 127\} )$ denote the MXINT mantissa and
+\( e \) the shared micro-exponent. Define:
 
-The CTA (thread block) uses a tiler:
-- `cta_tiler = (BLK_M, BLK_K)`
-and a block coordinate:
-- `cta_coord = (blockIdx.x, blockIdx.y)`
+$$
+\text{out} = \text{BF16}( \text{sign}(m),\ e,\ \text{frac}(|m|) )
+$$
 
-`local_tile(mX, cta_tiler, cta_coord)` selects the rectangular sub-tensor owned by the CTA:
+MXINT mantissas are not IEEE-normalised floating-point numbers and do not include an
+implicit leading bit. To extend the representable signed magnitude range using limited
+mantissa bits, MXINT uses the second most significant magnitude bit (the `0x40` bit)
+as a *region selector*.
 
-- Rows: `blockIdx.x * BLK_M ... blockIdx.x * BLK_M + BLK_M - 1`
-- Cols: `blockIdx.y * BLK_K ... blockIdx.y * BLK_K + BLK_K - 1`
+Let $( r = |m| \,\&\, 0x40 )$. The kernel applies one of two decoding rules:
 
-Thus, the global `(M, K)` matrix is decomposed into `(BLK_M × BLK_K)` tiles, each assigned to one CTA. The output tensor `mY` is tiled identically.
+$$
+y =
+\begin{cases}
+\text{out}, & r \neq 0 \\
+\text{out} - \text{bias}, & r = 0
+\end{cases}
+$$
 
-The shared exponent vector is tiled only along the group dimension (K). Each CTA loads the `BLK_K` exponents associated with the group-columns it processes, ensuring that all elements in a given column share the same exponent during reconstruction.
+where:
+
+$$
+\text{bias} = \text{BF16}(\text{sign}(m),\ e,\ 0)
+$$
+
+Intuitively:
+- If the region selector bit is set, the packed BF16 value already represents the
+  intended magnitude.
+- If it is not set, the value must be offset by a baseline corresponding to the
+  exponent bucket.
+
+The boolean predicate `dont_need_abs` (or equivalently `dont_need_bias`) selects between
+these two cases. This mechanism increases effective dynamic range without increasing
+mantissa width.
+
+---
+#### Question: How does `cta_tiler` partition the data for copy?
+##### CTA-Level Tiling with `cta_tiler` (CuTe `local_tile`)
+
+After reshaping, the MXINT mantissas are treated as a logical 2D tensor of shape:
+
+$$
+(M, K) = (\text{group\_size},\ \text{num\_groups})
+$$
+
+where:
+- the row dimension indexes elements within a group, and
+- the column dimension indexes groups (and shared exponents).
+
+The kernel partitions this tensor across CTAs using a tiler:
+
+$\text{cta\_tiler} = (\text{BLK\_M}, \text{BLK\_K})$
+
+with CTA coordinates:
+
+$$
+\text{cta\_coord} = (\text{blockIdx.x},\ \text{blockIdx.y})
+$$
+
+Applying `local_tile` selects the rectangular sub-tensor owned by each CTA:
+
+- Rows:  
+  $$
+  [\text{blockIdx.x} \cdot \text{BLK\_M},\ \dots]
+  $$
+- Columns:  
+  $$
+  [\text{blockIdx.y} \cdot \text{BLK\_K},\ \dots]
+  $$
+
+Thus, the global tensor is decomposed into independent
+$((\text{BLK\_M} \times \text{BLK\_K}))$ tiles, each processed by one CTA.
+The output tensor is tiled identically.
+
+The shared exponent vector is tiled only along the group (K) dimension, so each CTA
+loads exactly the exponents required for the columns it processes.
+
+This CTA-level work decomposition is conceptually identical to the CTA tiling used in
+CuTe GEMM kernels: CTAs own disjoint tiles of the output space, while the reduction (or
+streaming) dimension is iterated within the CTA when needed.
+
+<figure>
+  <img src="https://docs.nvidia.com/cutlass/latest/_images/tC_partitioning.png"
+       alt="CuTe tC thread partitioning"
+       width="400"/>
+  <figcaption>
+    Figure 4.1: CuTe <code>tC</code> thread layout and partitioning. The thread
+    layout defines how the output tile is decomposed across threads, with each
+    thread responsible for a structured sub-tile of the output matrix.
+  </figcaption>
+</figure>
+
+---
+#### Question: How does `layout_tX` partition the threads in a threadblock for computation?
+##### Thread-Level Partitioning with `layout_tX` (CuTe `local_partition`)
+
+Within each CTA, CuTe maps threads to elements of the CTA tile using a static thread
+layout:
+
+$$
+\text{layout\_tX} = (\text{THD\_M}, \text{THD\_K})
+$$
+
+with:
+$$
+\text{THD\_M} = \text{BLK\_M}, \quad \text{THD\_K} = \text{BLK\_K}
+$$
+
+This produces $(\text{BLK\_M} \times \text{BLK\_K})$ threads, each corresponding to a
+unique logical $((m, k))$ position in the CTA tile.
+
+Applying `local_partition` yields per-thread views of:
+- the global-memory tile,
+- the shared-memory tile, and
+- the output tile.
+
+Each thread:
+- cooperatively loads its assigned element from global memory,
+- reconstructs the BF16 value using the shared exponent for its column, and
+- writes the result back to global memory.
+
+This matches CuTe’s copy-partitioning model, where identical partitioning patterns are
+applied to source and destination tensors to preserve logical correspondence.
+
+<figure>
+  <img src="https://docs.nvidia.com/cutlass/latest/_images/TiledCopyA.png"
+       alt="CuTe TiledCopy partitioning"
+       width="400"/>
+  <figcaption>
+    Figure 4.2: CuTe <code>TiledCopy</code> partitioning for global-to-shared
+    memory copies. Each thread loads a small, contiguous block of elements,
+    enabling vectorised memory accesses and efficient cooperative copying.
+  </figcaption>
+</figure>
+
+
+Predication is implemented by partitioning an identity tensor through the same thread
+layout and masking threads whose logical coordinates fall outside valid bounds. This
+ensures correctness for partial tiles at tensor boundaries.
 
 ---
 
-### Question: How does `layout_sX` partition threads for computation? (CUTE `local_partition`)
+#### Compute Mapping and Exponent Reuse
 
-Within a CTA, CUTE uses a thread layout to map threads to elements of the CTA tile. The kernel constructs a 2D thread layout:
+Because threads are laid out across $((m, k))$, all threads sharing the same
+$(k)$-coordinate reuse the same shared micro-exponent. As a result:
 
-- `layout_tX = (thd_m, thd_k)`
-- `dimBlock = thd_m * thd_k`
+- The exponent is loaded once per group-column.
+- All rows in that column reuse it during reconstruction.
 
-In the configuration used by the kernel, `thd_m = BLK_M` and `thd_k = BLK_K`, so the block contains `BLK_M * BLK_K` threads. This makes the thread layout isomorphic to the tile shape: each thread corresponds to a unique logical `(m, k)` position in the CTA tile.
+This mirrors how CuTe partitions computation in GEMM kernels, where threads operate on
+logical sub-tiles of the output while sharing common operands.
 
-CUTE then creates per-thread views using `local_partition`:
-- `tXgX = local_partition(gX, layout_tX, threadIdx.x)` (thread view of global tile)
-- `tXsX = local_partition(sX, layout_sX, threadIdx.x)` (thread view of shared-memory tile)
 
-This mapping enables:
-- **Elementwise cooperative loading**: each thread loads its assigned element from global memory into shared memory (guarded by predication on boundary tiles).
-- **Elementwise reconstruction**: each thread reconstructs BF16 values for its assigned element(s), reusing the shared exponent corresponding to the tile column.
-- **Elementwise cooperative storing**: each thread writes its reconstructed output back to global memory (again predicated on bounds).
-
-Predication is implemented by partitioning an identity tensor through the same layout and comparing coordinates against the valid tile extents. This ensures that partial tiles at tensor boundaries do not issue out-of-bounds global memory accesses.
-
-A key property is exponent reuse: the exponent index is derived from the K-coordinate (group column). Because threads are laid out across `(m, k)`, all threads with the same `k` (column) reuse the same shared exponent, matching MXINT’s group semantics.
+<figure>
+  <img src="https://docs.nvidia.com/cutlass/latest/_images/TiledMmaC.png"
+       alt="CuTe TiledMMA partitioning"
+       width="400"/>
+  <figcaption>
+    Figure 4.3: CuTe <code>TiledMMA</code> partitioning. Threads are mapped to
+    fragments of the A, B, and C tensors corresponding to a single MMA
+    instruction, enabling structured accumulation and high arithmetic
+    intensity.
+  </figcaption>
+</figure>
 
 ---
 
-### Summary
+#### Summary
 
 The MXINT8 dequantisation kernel combines:
-- **Bit-level reconstruction** (sign/exponent/fraction packing plus a region-based bias correction),
-- **Block tiling at the CTA level** (`cta_tiler` via `local_tile`), and
-- **Thread-to-element mapping within a tile** (`layout_*` via `local_partition`),
 
-to minimise global memory traffic, maximise exponent reuse, and ensure correct boundary handling via predication. This illustrates how numerical format design (shared micro-exponents) and GPU execution strategy (tiling + cooperative copy) co-determine performance in custom low-level kernels.
+- region-based bit-level reconstruction,
+- CTA-level tiling via `cta_tiler` and `local_tile`, and
+- thread-level partitioning via `layout_tX` and `local_partition`,
+
+to minimise global memory traffic, maximise exponent reuse, and ensure correct boundary
+handling through predication. This illustrates how numerical format design and GPU
+execution strategy must be co-designed to achieve efficient low-level kernels.
+
 
 ---
 
-## Part E – Empirical Evaluation
+### Part E – Empirical Evaluation
 
 This section evaluates the MXINT8 dequantisation kernel empirically, focusing on:
 (i) latency characteristics on CPU versus GPU, and
@@ -745,14 +1023,14 @@ This section evaluates the MXINT8 dequantisation kernel empirically, focusing on
 
 ---
 
-### Latency Profiling: CPU vs GPU Dequantisation
+#### Latency Profiling: CPU vs GPU Dequantisation
 
 We benchmarked the MXINT8 dequantisation kernel using the provided test suite
 (`test_ext_dequantize1d_latency`), which compares the host reference
 implementation against the CUDA kernel across a range of tensor sizes and
 group sizes.
 
-#### Observed performance regimes
+##### Observed performance regimes
 
 | Tensor size | Relative performance | Interpretation |
 |------------|----------------------|----------------|
@@ -768,7 +1046,7 @@ becomes orders of magnitude faster than the CPU version. In this regime, kernel
 launch overhead is amortised, and performance is dominated by sustained memory
 bandwidth rather than arithmetic complexity.
 
-#### Interpretation
+##### Interpretation
 
 The MXINT8 dequantisation kernel is primarily **memory-bandwidth bound**. Once
 sufficient data is available to saturate device memory throughput, the GPU’s
@@ -778,7 +1056,7 @@ memory traffic rather than computation.
 
 ---
 
-### GPU Memory Savings in a Real Model
+#### GPU Memory Savings in a Real Model
 
 To evaluate the practical impact of MXINT8 quantisation, we applied the
 `QLinearPacked` layer to a real Transformer-based emotion classification model
@@ -790,7 +1068,7 @@ and measured peak GPU memory usage during inference.
 - Precision: FP32 baseline vs MXINT8 weight-only quantisation
 - Mode: `eval()` with `torch.no_grad()`
 
-#### Peak memory usage
+##### Peak memory usage
 
 | Model variant | Peak GPU memory | Reduction |
 |--------------|------------------|------------|
@@ -803,7 +1081,7 @@ for this example.
 
 ---
 
-### Question: Why is the observed memory saving not the theoretical 74.2%?
+#### Question: Why is the observed memory saving not the theoretical 74.2%?
 
 The commonly cited theoretical reduction for MXINT8 weight storage,
 
@@ -832,7 +1110,7 @@ reduction (~20%) is lower due to several factors:
    fragmentation, and temporary buffers. Peak memory does not scale linearly with
    parameter size alone.
 
-#### Interpretation
+##### Interpretation
 
 The theoretical 74.2% reduction applies only to isolated weight storage.
 In a realistic inference workload, peak GPU memory reflects activations,
@@ -842,7 +1120,7 @@ saving achieved without changing model predictions.
 
 ---
 
-### Conclusion
+#### Conclusion
 
 This lab demonstrates that the most substantial performance improvements in deep
 learning systems arise from **algorithmic restructuring and hardware-aware
@@ -862,7 +1140,7 @@ correctly interpret performance results.
 
 ---
 
-### Key Takeaways
+#### Key Takeaways
 
 - Compilation overhead must be amortised to realise benefits from
   `torch.compile`.
@@ -881,3 +1159,6 @@ correctly interpret performance results.
 
 [1] PyTorch Documentation. *torch.compile End-to-End Tutorial*.  
 https://docs.pytorch.org/tutorials/intermediate/torch_compile_full_example.html
+
+[2] NVIDIA CUTLASS Documentation. *CuTe GEMM Tutorial (Copy partitioning)*.  
+https://docs.nvidia.com/cutlass/latest/media/docs/cpp/cute/0x_gemm_tutorial.html

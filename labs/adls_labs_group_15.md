@@ -28,9 +28,15 @@ We investigate how we can make our models more efficient by quantising and pruni
 ### Quantisation
 We focus on fixed-point quantisation in this lab. This is where floating-point weights and activations are represented using a limited number of bits. We compare Post-Training Quantisation (PTQ) and Quantisation-Aware Training (QAT). PTQ applies quantisation after training without modifying the model. QAT is when quantisation effects are simulated during training to allow the model to adapt. We sweep bit-widths from 4 to 32 showing how reduced precision degrades accuracy and how QAT can recover performance at lower bit-widths compared to PTQ. <br>
 
-Our workflow is
+QAT introduces quantisation effects during training, then we retrain the model for one epoch. This allows the models parameters to be adjusted to the noise quantisation may create. 
+Quantisation width is the number of bits used to represent a number. We vary the width and evaluate how this affects the models accuracy. An increased quantisation width will clearly increase the accuracy as there are fewer rounding errors and therefore higher precision. Here we compare the bit lengths '[4, 8, 16, 32]' for both PTQ and QAT.
+
+![](images/Lab1-Quantisation-Results)
+*How quantisation width affects model accuracy for Post-Training Quantisation (PTQ) and Quantisation-Aware Training (QAT)*
+
 
 ### Pruning
+Pruning is a method for increasing model sparsity by removing less important parameters. Higher sparsity corresponds to a larger fraction of weights being removed and we vary the sparsity level in this part of the lab. We can evaluate using random pruning, which removes weights at random or L1-norm pruning, which removes weights with the smallest magnitudes. We find that rule based pruning preserves accuracy better than random pruning, especially as we try and push our sparsity to a high level. <br>
 
 ### Conclusion
 

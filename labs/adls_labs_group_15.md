@@ -67,7 +67,16 @@ def make_quantization_config(w: int):
 ### Pruning
 Pruning is a method for increasing model sparsity by removing less important parameters. Higher sparsity corresponds to a larger fraction of weights being removed and we vary the sparsity level in this part of the lab. We can evaluate using random pruning, which removes weights at random or L1-norm pruning, which removes weights with the smallest magnitudes. We find that rule based pruning preserves accuracy better than random pruning, especially as we try and push our sparsity to a high level. <br>
 
-### Conclusion
+We enforce the same sparsity across both weights and activations, with pruning performed locally so that each tensor is pruned independently based on its own metadata. Sparsity is swept from 0.1 to 0.9 using fine granularity to identify the point at which accuracy degrades sharply
+
+Pruning has a much higher computational demand compared to quantisation. To combat any error and repeated execution caused by this, we added checkpoints after each run, a cooldown period between each run and explicit memory clean up.
+
+All pruning experiments include one epoch of post-pruning fine-tuning as retraining is generally required to recover accuracy after parameters have been removed, much like in QAT.
+
+![](images/Lab1-Pruning-Results.png)
+*How Random and L1-Pruning affect model evaluation accuracy at a sweeping range of sparsity levels.*
+
+Pruning is applied incrementally at each sparsity level, and the pruned model is evaluated on the IMDb dataset to measure the highest model accuracy. The results show that accuracy decreases as sparsity increases for both methods, but L1-norm pruning consistently preserves accuracy better than random pruning, particularly at higher sparsity levels. This gap widens as sparsity approaches extreme values, demonstrating that structured pruning strategies are more robust when aggressively compressing the model. Here pruning effects seem to be more gradual than quantisation effects observed in Lab 1.
 
 ---
 

@@ -946,10 +946,10 @@ Dequantisation reconstructs a BF16 value by explicitly assembling its bit fields
 Let $( m \in \{-128, \dots, 127\} )$ denote the MXINT mantissa and
 \( e \) the shared micro-exponent. Define:
 
-$$`
+$`
 \text{out} = \text{BF16}( \text{sign}(m),\ e,\ \text{frac}(|m|) )
 `
-$$
+$
 
 MXINT mantissas are not IEEE-normalised floating-point numbers and do not include an
 implicit leading bit. To extend the representable signed magnitude range using limited

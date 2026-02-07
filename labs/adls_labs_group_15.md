@@ -1014,11 +1014,11 @@ Applying `local_tile` selects the rectangular sub-tensor owned by each CTA:
 
 - Rows:
   ```math
-  \text{blockIdx.x} \cdot \text{BLK\_M},\, \dots
+  [\text{blockIdx.x} \cdot \text{BLK\_M},\, \dots]
   ```
 - Columns:
   ```math
-  text{blockIdx.y} \cdot \text{BLK\_K},\, \dots
+  [\text{blockIdx.y} \cdot \text{BLK\_K},\, \dots]
   ```
 
 Thus, the global tensor is decomposed into independent
@@ -1059,7 +1059,7 @@ with:
 \text{THD\_M} = \text{BLK\_M}, \qquad \text{THD\_K} = \text{BLK\_K}
 ```
 
-This produces $\text{BLK\_M} \times \text{BLK\_K}$ threads, each corresponding to a unique
+This produces $`\text{BLK\_M} \times \text{BLK\_K}`$ threads, each corresponding to a unique
 logical $(m, k)$ position within the CTA tile.
 
 Applying `local_partition` yields per-thread views of:

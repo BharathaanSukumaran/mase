@@ -259,7 +259,121 @@ This lab constructs the NAS workfow for BERT, then shows how to train, evaluate 
 
 ### Task 1
 
+We compare two Optuna samplers to find the best BERT architecture for IMDb classification. The `GridSampler` searches only the model configuration parameters (`num_layers`, `num_heads`, `hidden_size`, `intermediate_size`), while the `TPESampler` additionally searches over per-layer type choices (replacing square `nn.Linear` layers with `Identity`). Both studies run for 15 trials with 1 epoch of training each.
+
+The shared search space is defined as:
+```pythong
+search_space = {
+    "num_layers": [2, 4, 8],
+    "num_heads": [2, 4, 8, 16],
+    "hidden_size": [128, 192, 256, 384, 512],
+    "intermediate_size": [512, 768, 1024, 1536, 2048],
+    "linear_layer_choices": [nn.Linear, Identity],
+}
+```
+
+A key implementation detail is that `GridSampler` cannot handle the dynamic parameter names introduced by per-layer `suggest_categorical` calls (the parameter names depend on the sampled number of layers), so we restrict it to a config-only model constructor. This constructor only samples from the four config-level parameters:
+```python
+def construct_model_grid_only(trial):
+    config = AutoConfig.from_pretrained(checkpoint)
+    for param in ["num_layers", "num_heads", "hidden_size", "intermediate_size"]:
+        chosen_idx = trial.suggest_int(param, 0, len(search_space[param]) - 1)
+        if param == "num_layers":
+            setattr(config, "num_hidden_layers", search_space[param][chosen_idx])
+        elif param == "num_heads":
+            setattr(config, "num_attention_heads", search_space[param][chosen_idx])
+        else:
+            setattr(config, param, search_space[param][chosen_idx])
+    return AutoModelForSequenceClassification.from_config(config)
+```
+
+The `TPESampler` uses the full `construct_model` function which additionally iterates over every `nn.Linear` layer with matching input/output dimensions and calls `trial.suggest_categorical` to decide whether to keep it or replace it with an `Identity` module:
+```python
+def construct_model(trial):
+    config = AutoConfig.from_pretrained(checkpoint)
+    for param in ["num_layers", "num_heads", "hidden_size", "intermediate_size"]:
+        chosen_idx = trial.suggest_int(param, 0, len(search_space[param]) - 1)
+        setattr(config, param, search_space[param][chosen_idx])
+    trial_model = AutoModelForSequenceClassification.from_config(config)
+    for name, layer in trial_model.named_modules():
+        if isinstance(layer, nn.Linear) and layer.in_features == layer.out_features:
+            new_layer_cls = trial.suggest_categorical(
+                f"{name}_type", search_space["linear_layer_choices"])
+            if new_layer_cls == Identity:
+                deepsetattr(trial_model, name, Identity())
+    return trial_model
+```
+
+Both samplers are instantiated and optimised for 15 trials each:
+
+![](images/task1_sampler_comparison.png)
+*Running best accuracy over 15 trials for GridSampler (config-only) vs TPESampler (config + layer choices)*
+
+| Sampler | Search Space | Best Accuracy | Best Trial |
+|---------|-------------|---------------|------------|
+| GridSampler | Config params only | 0.86832 | Trial 0 |
+| TPESampler | Config + layer choices | 0.86520 | Trial 14 |
+
+The `GridSampler` achieves its best accuracy (0.86832) on its very first trial and maintains it as the running best across all 15 trials. This is because grid sampling deterministically enumerates parameter combinations, and the first combination happened to be a strong configuration (8 layers, 8 heads, hidden size 384, intermediate size 1024).
+
+The `TPESampler` starts lower at 0.845 and gradually improves as it accumulates trial history to guide sampling, reaching 0.8652 by trial 14. The expanded search space (layer type choices) makes it harder for TPE to find good configurations within 15 trials. Replacing linear layers with `Identity` modules often degrades performance since it removes learned transformations, and several of the TPE trials sample many Identity replacements.
+
+The `GridSampler` wins this comparison, suggesting that with a moderate budget of 15 trials, a systematic config-only search outperforms a Bayesian search over a larger, more complex space. With significantly more trials, TPE's ability to model parameter interactions could eventually surpass grid search, but within a limited budget the simpler approach prevails.
+
 ### Task 2
+
+We extend the NAS pipeline with compression-aware optimisation. Each trial now includes: (1) training the sampled model for 1 epoch, (2) applying MASE's `CompressionPipeline` with integer quantisation (Q4.4, 8-bit) and L1-norm pruning (50% sparsity), and (3) optionally post-training the compressed model for 1 additional epoch. Since the `GridSampler` from Task 1 cannot handle the dynamic layer-choice parameters, Task 2 falls back to `TPESampler` for all compression studies.
+
+The compression configuration uses:
+- **Quantisation**: integer format, 8-bit width with 4-bit fractional for data, weights, and biases
+- **Pruning**: L1-norm, 50% sparsity, local scope for both weights and activations
+
+These are defined inside the objective so that configs are not mutated across trials:
+```python
+quantization_config = {
+    "by": "type",
+    "default": {"config": {"name": None}},
+    "linear": {
+        "config": {
+            "name": "integer",
+            "data_in_width": 8, "data_in_frac_width": 4,
+            "weight_width": 8, "weight_frac_width": 4,
+            "bias_width": 8, "bias_frac_width": 4,
+        }
+    },
+}
+pruning_config = {
+    "weight":     {"sparsity": 0.5, "method": "l1-norm", "scope": "local"},
+    "activation": {"sparsity": 0.5, "method": "l1-norm", "scope": "local"},
+}
+```
+
+We then run two 15-trial studies — one without post-training and one with — and plot the running best alongside the Task 1 baseline:
+```python
+study_comp_no_post = optuna.create_study(direction="maximize", sampler=task2_sampler)
+study_comp_no_post.optimize(
+    make_compression_objective(post_train=False), n_trials=15)
+
+study_comp_post = optuna.create_study(direction="maximize", sampler=task2_sampler)
+study_comp_post.optimize(
+    make_compression_objective(post_train=True), n_trials=15)
+```
+
+![](images/task2_compression_aware_nas.png)
+*Running best accuracy comparing uncompressed baseline, compression without post-training, and compression with post-training*
+
+| Variant | Best Accuracy | Best Trial |
+|---------|--------------|------------|
+| Best Task 1 (no compression) | 0.86832 | — |
+| Compression-aware (no post-train) | 0.83828 | Trial 13 |
+| Compression-aware (+ post-train) | 0.87268 | Trial 9 |
+
+Without post-training, the compressed models suffer a significant accuracy drop. The running best starts at 0.768 and climbs slowly to 0.838 after 15 trials. The combined effect of quantisation and pruning is destructive when the model cannot adapt its weights afterwards, confirming the findings from Lab 1 that compression is a lossy process.
+
+With post-training, the compressed models recover and even exceed the uncompressed baseline. The running best climbs from 0.844 to 0.873, surpassing the uncompressed baseline of 0.868. The post-training loss values (starting around 0.31–0.38 at step 500) are substantially lower than the initial training losses (starting around 0.66–0.70), indicating that the model is fine-tuning from an already good starting point.
+
+The fact that the post-trained compressed model can exceed the uncompressed baseline was quite interesting. Our thoughts are that quantisation and pruning act as regularisers, preventing overfitting on the IMDb dataset. The combination of architecture search, compression, and post-training finds models that are both smaller and more accurate than the uncompressed search alone.
+
 ---
 
 ## Lab 3 – Mixed-Precision Quantisation Search

@@ -955,21 +955,22 @@ implicit leading bit. To extend the representable signed magnitude range using l
 mantissa bits, MXINT uses the second most significant magnitude bit (the `0x40` bit)
 as a *region selector*.
 
-Let $( r = |m| \,\&\, 0x40 )$. The kernel applies one of two decoding rules:
+Let $`( r = |m| \,\&\, 0x40 )`$. The kernel applies one of two decoding rules:
 
-$$
+$`
 y =
 \begin{cases}
 \text{out}, & r \neq 0 \\
 \text{out} - \text{bias}, & r = 0
 \end{cases}
-$$
+`
+$
 
 where:
 
-$$
+$`
 \text{bias} = \text{BF16}(\text{sign}(m),\ e,\ 0)
-$$
+`$
 
 Intuitively:
 - If the region selector bit is set, the packed BF16 value already represents the
@@ -987,8 +988,9 @@ mantissa width.
 
 After reshaping, the MXINT mantissas are treated as a logical 2D tensor of shape:
 
-$
+$`
 (M, K) = (\text{group\_size},\ \text{num\_groups})
+`
 $
 
 where:

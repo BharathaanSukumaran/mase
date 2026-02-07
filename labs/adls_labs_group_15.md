@@ -955,7 +955,7 @@ implicit leading bit. To extend the representable signed magnitude range using a
 number of mantissa bits, MXINT uses the second most significant magnitude bit (`0x40`)
 as a *region selector*.
 
-Let $r = |m| \,\&\, 0x40$. The kernel applies one of two decoding rules:
+Let $`r = |m| \,\&\, 0x40`$. The kernel applies one of two decoding rules:
 
 ```math
 y =
@@ -1013,16 +1013,16 @@ with CTA coordinates:
 Applying `local_tile` selects the rectangular sub-tensor owned by each CTA:
 
 - Rows:
-  ```nath
-  [\text{blockIdx.x} \cdot \text{BLK\_M},\, \dots]
+  ```math
+  \text{blockIdx.x} \cdot \text{BLK\_M},\, \dots
   ```
 - Columns:
   ```math
-  [\text{blockIdx.y} \cdot \text{BLK\_K},\, \dots]
+  text{blockIdx.y} \cdot \text{BLK\_K},\, \dots
   ```
 
 Thus, the global tensor is decomposed into independent
-$(\text{BLK\_M} \times \text{BLK\_K})$ tiles, each processed by one CTA. The output tensor
+$`(\text{BLK\_M} \times \text{BLK\_K})`$ tiles, each processed by one CTA. The output tensor
 is tiled identically.
 
 The shared exponent vector is tiled only along the group (K) dimension, so each CTA loads

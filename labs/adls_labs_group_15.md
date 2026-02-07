@@ -946,17 +946,16 @@ Dequantisation reconstructs a BF16 value by explicitly assembling its bit fields
 Let $( m \in \{-128, \dots, 127\} )$ denote the MXINT mantissa and
 \( e \) the shared micro-exponent. Define:
 
-$`
+$$
 \text{out} = \text{BF16}( \text{sign}(m),\ e,\ \text{frac}(|m|) )
-`
-$
+$$
 
 MXINT mantissas are not IEEE-normalised floating-point numbers and do not include an
 implicit leading bit. To extend the representable signed magnitude range using limited
 mantissa bits, MXINT uses the second most significant magnitude bit (the `0x40` bit)
 as a *region selector*.
 
-Let $`( r = |m| \,\&\, 0x40 )`$. The kernel applies one of two decoding rules:
+Let $( r = |m| \,\&\, 0x40 )$. The kernel applies one of two decoding rules:
 
 $$
 y =
@@ -988,9 +987,9 @@ mantissa width.
 
 After reshaping, the MXINT mantissas are treated as a logical 2D tensor of shape:
 
-$$
+$
 (M, K) = (\text{group\_size},\ \text{num\_groups})
-$$
+$
 
 where:
 - the row dimension indexes elements within a group, and

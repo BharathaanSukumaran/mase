@@ -306,17 +306,528 @@ Quantization is a process that allows model sizes to reduce, allowing for more e
 
 ---
 
-## Lab 4 – System Performance and torch.compile
+## Lab 4 – System Performance Tuning & Enhancement
+
+### Overview
+
+This lab investigates system-level performance optimisation for deep learning workloads in PyTorch, progressing from high-level compiler-based techniques to low-level custom kernel implementations. The experiments are structured to highlight the trade-offs between automation, algorithmic kernel design, and hardware-aware optimisation.
+
+Specifically, we study:
+1. Automatic graph-level optimisation using `torch.compile`.
+2. Manual kernel fusion through the fused Scaled Dot-Product Attention (SDPA) operator.
+3. Custom CUDA kernels for MXINT8 dequantisation and their impact on latency and GPU memory usage.
+
+All experiments are evaluated from a systems perspective, with attention to benchmarking methodology, hardware constraints, and practical deployment implications.
+
+---
 
 ### Setup
 
-### Results
+**Hardware**
+- GPU: NVIDIA GeForce RTX 2050 (4 GB)
+- CPU: 13th Gen Intel(R) Core(TM) i5-13420H
+- Memory: 16GB
 
-### Observations
+**Software**
+- OS: Ubuntu 24.04.3 LTS
+- PyTorch: 2.10.0+cu128
+- CUDA: 12.8
+- Transformers: 5.1.0
 
-### Conclusion
+**Benchmarking protocol**
+- Inference-only measurements using `model.eval()` and `torch.no_grad()`.
+- Warm-up iterations executed before timing.
+- GPU timing performed with CUDA events and explicit synchronization.
+- Data loading, tokenization, and host–device transfers excluded from timed regions.
 
-### Key Takeaways
+---
+
+### Part A – Automatic Optimisation with `torch.compile`
+
+#### Background
+
+`torch.compile` is a just-in-time (JIT) compilation framework introduced in PyTorch 2.0. It captures Python-level model execution, constructs a graph representation, and lowers this graph to optimised kernels. The compilation pipeline consists of three main components:
+
+- **TorchDynamo**, which captures PyTorch programs via Python bytecode interception.
+- **TorchInductor**, which performs graph rewriting, operator fusion, and kernel generation using Triton, a specialized language and compiler for GPU programming (to define custom GPU kernels).
+- **AOT Autograd**, which enables whole-graph capture across forward and backward passes.
+
+The PyTorch documentation notes that the first executions of a compiled model are expected to be slower due to compilation overhead, and that larger speedups are more readily observed on datacenter-class GPUs.
+
+
+#### Question: Why can `torch.compile` appear slower, and when does it help?
+
+In early experiments, the compiled model sometimes appeared slower than the eager (uncompiled) model. This behaviour is expected and arises from several factors:
+
+1. **Compilation overhead**  
+   Initial executions include graph capture and kernel generation. For small batch sizes or short benchmark runs, this overhead dominates total runtime.
+
+2. **Benchmarking artifacts**  
+   Timing utilities, CUDA synchronization, and Python-level overhead can distort measurements if included inside the timed region. Mixing warm-up and steady-state iterations further biases results against the compiled path.
+
+3. **Hardware limitations**  
+   The RTX 2050 is a consumer-grade GPU with limited memory bandwidth and shared-memory capacity. As a result, the achievable speedups are smaller than those reported on datacenter GPUs such as V100, A100, or H100.
+
+When benchmarking is performed correctly and the model is executed in steady state, `torch.compile` provides consistent but modest speedups on both CPU and GPU.
+
+#### Benchmarking methodology and design decisions
+
+The starter benchmarking code measured individual forward passes inside a Python loop and experimented with compiling timing utilities themselves. We found this approach introduced avoidable overhead and high variance, particularly on GPU, where per-iteration synchronization dominated the measured time.
+
+The benchmarking methodology used in this section deviates from the starter benchmarking code in order to obtain stable and meaningful performance measurements. In particular, we revised the timing setup to:
+
+- Separate warm-up iterations from steady-state measurements,
+- Use explicit CUDA synchronization when benchmarking on GPU,
+- Exclude timing utilities themselves from the compiled region, and
+- Ensure inference-only execution using `model.eval()` and `torch.no_grad()`.
+
+These design choices follow the recommendations and methodology outlined in the official PyTorch *torch.compile End-to-End Tutorial* [1], which explicitly notes that:
+(i) the first few iterations of a compiled model are expected to be slower due to compilation overhead, and
+(ii) speedups are hardware-dependent and may be smaller on non-datacenter GPUs.
+
+Our revised benchmarking functions therefore align with PyTorch’s recommended practice for evaluating `torch.compile`, and avoid misleading conclusions caused by measurement overhead or compilation warm-up effects.
+
+
+#### Results
+
+| Device | Execution Mode | Runtime (s) | Speedup |
+|------|----------------|-------------|----------|
+| CPU  | Eager          | 2.86        | 1.00×    |
+| CPU  | Compiled       | 1.90        | 1.50×    |
+| GPU  | Eager          | 0.171       | 1.00×    |
+| GPU  | Compiled       | 0.133       | 1.29×    |
+
+#### Observations (Deep Learning Systems perspective)
+
+- `torch.compile` introduces a cold-start latency due to graph capture and kernel compilation, which must be amortised over repeated executions.
+- Speedups on consumer GPUs are smaller than those reported in datacenter settings due to hardware constraints.
+- Correct benchmarking methodology is critical; performance conclusions can change significantly if warm-up, synchronization, and timing overhead are not handled carefully.
 
 
 ---
+
+### Part B – Kernel Fusion: Naive vs Fused SDPA
+
+#### Background
+
+Kernel fusion is a performance optimisation technique that reduces overhead by collapsing multiple logical operators into a single kernel. This reduces both kernel launch costs and, more importantly, global memory traffic. The benefits of kernel fusion are most pronounced in memory-bound workloads, where performance is limited by memory bandwidth rather than arithmetic throughput.
+
+Scaled Dot-Product Attention (SDPA) is a canonical example. In its naive formulation, attention is decomposed into a sequence of operations:
+
+1. A matrix multiplication to compute attention scores (QKᵀ),
+2. A scaling operation,
+3. A softmax over the attention scores, and
+4. A second matrix multiplication to compute the weighted sum with V.
+
+Each of these operations is typically implemented as a separate kernel. Intermediate results, including the full attention matrix, are materialised in global memory and subsequently reloaded by later kernels. This leads to excessive global memory reads and writes, and makes the computation memory-bandwidth bound.
+
+PyTorch provides a fused SDPA implementation via `torch.nn.functional.scaled_dot_product_attention`, which is based on the FlashAttention algorithm. Rather than accelerating individual operators, FlashAttention reformulates the attention computation to avoid materialising the full attention matrix altogether.
+
+#### Profiling Results
+
+| Device | Implementation | Dominant Kernel | Total Runtime |
+|------|----------------|-----------------|----------------|
+| CPU  | Naive SDPA     | `aten::bmm`     | ~2.38 s        |
+| CPU  | Fused SDPA     | FlashAttention (CPU) | ~70.7 ms |
+| CUDA | Naive SDPA     | `aten::bmm` + softmax | ~6.49 ms |
+| CUDA | Fused SDPA     | FlashAttention (CUDA) | ~2.21 ms |
+
+#### Observations
+
+- On CPU, the fused SDPA implementation yields approximately a 33× speedup over the naive formulation.
+- On GPU, the fused implementation achieves an approximate 3× speedup.
+- In both cases, the naive implementation is dominated by matrix multiplication and softmax kernels, while the fused path executes a single attention kernel.
+- The magnitude of the speedup differs between CPU and GPU, but the qualitative behaviour is consistent across devices.
+
+#### Why is the speedup larger on CPU than on GPU?
+
+Although kernel fusion improves performance on both CPU and GPU, the relative speedup is substantially larger on CPU. This difference arises from how naive SDPA is executed on each architecture.
+
+On CPU, the naive SDPA implementation executes as a sequence of independent high-level operators, each of which:
+- Materialises large intermediate tensors in main memory,
+- Performs full memory traversals for matrix multiplication and softmax, and
+- Incurs repeated cache misses due to limited reuse of intermediate results.
+
+As a result, the naive CPU implementation is strongly memory-bandwidth bound and suffers from poor cache locality. Kernel fusion eliminates most intermediate tensor materialisation and reduces memory traffic, leading to a dramatic reduction in execution time.
+
+On GPU, the naive implementation is already partially optimised:
+- Matrix multiplications are executed using highly optimised cuBLAS kernels,
+- Softmax kernels are reasonably efficient, and
+- GPU memory bandwidth is significantly higher than CPU memory bandwidth.
+
+Although the naive GPU implementation still incurs multiple kernel launches and global memory reads, these overheads represent a smaller fraction of total runtime compared to CPU. Consequently, kernel fusion yields a smaller relative speedup on GPU, even though the absolute runtime improvement remains significant.
+
+In summary, kernel fusion removes a larger proportion of inefficiency in the CPU execution path than in the GPU path. The GPU already benefits from specialised compute kernels and high bandwidth, whereas the CPU naive implementation exposes more opportunities for optimisation through fusion.
+
+
+#### Systems Interpretation
+
+The performance gains observed are primarily due to reduced memory traffic rather than faster arithmetic. In the naive SDPA implementation, the attention matrix is fully materialised in global memory, then repeatedly read and written by subsequent kernels. This results in high global memory bandwidth consumption and poor data locality.
+
+FlashAttention avoids this bottleneck by computing attention in tiles. Query, key, and value blocks are streamed from global memory into on-chip storage (registers and shared memory), and partial dot products are accumulated incrementally. A numerically stable “online softmax” is applied during this process, allowing the attention output to be computed without ever forming the full attention matrix in memory.
+
+By fusing the entire attention computation into a single kernel and operating on small tiles, FlashAttention:
+- Eliminates intermediate tensor materialisation,
+- Reduces global memory reads and writes,
+- Increases arithmetic intensity, and
+- Improves cache, shared memory, and register locality.
+
+This experiment demonstrates that kernel fusion is not merely an implementation detail, but an algorithmic transformation. The largest performance gains arise from restructuring the computation to better match the memory hierarchy, rather than from general-purpose compiler optimisations alone.
+
+---
+
+### Part C – Custom Kernels and MXINT8 Quantisation
+
+#### Motivation: Why Custom Kernels Matter for Quantisation
+
+While PyTorch provides highly optimised kernels for common numerical formats such as FP32, FP16, and BF16, these kernels are designed for general-purpose floating-point execution. When models are quantised to custom numerical formats, such as MXINT, default kernels are no longer optimal.
+
+To fully exploit the benefits of quantisation, custom kernels are required. These kernels can be designed to:
+- Operate directly on the quantised representation,
+- Avoid unnecessary format conversions,
+- Exploit hardware-friendly data layouts, and
+- Minimise memory traffic and instruction overhead.
+
+In this lab, a custom MXINT8 dequantisation kernel is used to demonstrate how numerical format design and kernel implementation interact to improve performance and memory efficiency.
+
+---
+
+#### MXINT8 Format Recap
+
+MXINT is a block-scaled numerical format that lies between floating-point and fixed-point representations. Instead of storing a separate exponent for every value, MXINT groups multiple values together and shares a single exponent across the group.
+
+An MXINT vector consists of:
+- One shared 8-bit exponent (biased by 127), and
+- Multiple signed fixed-point mantissas.
+
+This structure can be represented as:
+
+```
+
+Exp |- Mantissa 1
+|- Mantissa 2
+|- ...
+|- Mantissa (group_size)
+
+```
+
+During dequantisation, each mantissa is scaled by the same exponent factor. This preserves dynamic range while significantly reducing storage overhead compared to standard floating-point formats.
+
+---
+
+#### Question: How does MXINT8 benefit custom hardware when both activations and weights are quantised?
+
+When both activations and weights in a linear layer are quantised to MXINT8, the format provides several key advantages for custom hardware and specialised execution kernels.
+In a linear layer, where computation is dominated by large matrix multiplications, these advantages directly translate into lower memory traffic for multiply and accumulate operations and higher effective throughput.
+
+
+#### 1. Reduced Memory Footprint and Bandwidth
+
+MXINT8 significantly reduces the number of bits required per value compared to FP16 or FP32. Fewer bits per tensor element lead to:
+- Lower memory bandwidth requirements,
+- Improved cache utilisation, and
+- Reduced pressure on global memory.
+
+This is particularly beneficial for memory-bound workloads such as large matrix multiplications, where performance is often limited by data movement rather than compute.
+
+#### 2. Simplified Arithmetic and Compute Units
+
+MXINT mantissas are fixed-point values and can be processed using integer arithmetic. Because the exponent is shared across a group:
+- Expensive per-element exponent handling is avoided,
+- Arithmetic datapaths are simplified, and
+- Hardware can use smaller, more energy-efficient compute units.
+
+This enables higher throughput and lower power consumption compared to fully general-purpose floating-point execution.
+
+#### 3. Hardware-Friendly Dataflow and Parallelism
+
+The block structure of MXINT aligns naturally with SIMD, systolic array, and tensor-core-style architectures. A custom kernel or accelerator can:
+- Load one exponent per group,
+- Stream multiple mantissas through the same datapath, and
+- Reuse scaling logic across many values.
+
+This increases arithmetic intensity, improves data reuse, and reduces instruction overhead, all of which are critical for efficient accelerator design.
+
+#### 4. Reduced General-Purpose Overhead (“Turing Tax”)
+
+By fixing the numerical format and dataflow, MXINT8 enables hardware designs that move away from fully general-purpose execution. Compared to FP32 or FP16 execution:
+- Instruction fetch and decode overhead is reduced,
+- Control logic is simplified, and
+- More silicon area can be devoted to useful computation.
+
+This reduces the so-called *Turing Tax*: the performance and energy cost of using a universal programmable processor instead of a domain-specific accelerator.
+
+---
+
+### Role of the Custom MXINT8 Dequantisation Kernel
+
+The custom MXINT8 dequantisation kernel used in this lab illustrates how these hardware advantages are realised in practice:
+- The shared exponent is loaded once per group,
+- Mantissas are converted using simple fixed-point scaling,
+- Intermediate representations are minimised, reducing memory traffic, and
+- Dequantisation is tightly integrated into the computation pipeline.
+
+Compared to naïve, element-wise dequantisation using floating-point kernels, this approach is both more memory-efficient and better aligned with accelerator-style execution. Although dequantisation is unavoidable when executing linear layers in higher precision, performing it in a block-wise and kernel-fused manner ensures that the overhead does not negate the benefits of quantisation.
+
+
+---
+
+### Summary
+
+MXINT8 benefits custom hardware when both weights and activations are quantised because it enables:
+- Compact data representation,
+- Integer-dominant arithmetic,
+- Efficient block-wise computation, and
+- Hardware designs that minimise general-purpose execution overhead.
+
+In combination with custom kernels, MXINT8 allows accelerators to achieve high performance and energy efficiency while maintaining acceptable numerical accuracy. This reinforces a central theme of this lab: the largest performance gains arise not only from compiler optimisations, but from co-designing numerical formats, kernels, and hardware execution models.
+
+---
+
+## Part D – MXINT8 Dequantisation Kernel
+
+### Kernel overview
+
+The MXINT8 dequantisation kernel implements a weight-only quantisation workflow in which persistent weights are stored in a compact MXINT8 representation and expanded only when needed:
+
+1. **Load** MXINT8 mantissas (`int8`) and shared micro-exponents (`uint8`) from global memory.
+2. **Dequantise in-kernel** by reconstructing BF16 values using bit-level packing and a small correction step.
+3. **Store** dequantised BF16 weights back to global memory for subsequent computation (e.g., GEMM).
+
+This design reduces persistent memory footprint (MXINT8 storage) while retaining higher-precision arithmetic during compute. After the layer finishes, the temporary BF16 weights can be discarded.
+
+---
+
+### Question: Purpose of `dont_need_abs` and `bias`
+
+The host reference implementation (mirrored by the device kernel) reconstructs BF16 values by packing sign, exponent, and fraction fields:
+
+- **Sign bit** comes from the MXINT mantissa sign.
+- **Exponent** comes from the shared micro-exponent (`scale`) for the group.
+- **Fraction** comes from the lower bits of the mantissa magnitude.
+
+A simplified view of the reconstruction logic is:
+
+- `out`: BF16 bit-pattern composed from `(sign | exponent | fraction)`
+- `bias`: BF16 value composed from `(sign | exponent | 0)` (same sign and exponent, zero fraction)
+
+MXINT mantissas are not IEEE-normalised floats and therefore do not have an implicit leading 1. To represent a wider signed magnitude range using limited mantissa bits, MXINT uses a **region selector bit** (the `0x40` bit in the mantissa magnitude). This bit determines which decoding rule should be applied:
+
+- If the region selector bit is set (`mantissa_abs & 0x40 != 0`), the packed value `out` already represents the intended magnitude and can be used directly.
+- If the region selector bit is not set, the packed value must be offset-corrected by subtracting `bias`.
+
+Formally, the kernel implements:
+
+- **Rule A (no correction):** `y = out`
+- **Rule B (offset correction):** `y = out - bias`
+
+Here, `dont_need_abs` (or equivalently `dont_need_bias`) is the predicate selecting between these two decoding rules, and `bias` provides the baseline constant for the exponent bucket. This mechanism increases the effective representable range without increasing mantissa width.
+
+---
+
+### Question: How does `cta_tiler` partition data for copying? (CUTE `local_tile`)
+
+In the CUDA kernel, the 1D mantissa array is reshaped into a logical 2D matrix by grouping elements according to `group_size`:
+
+- Let `M = group_size`
+- Let `K = num_groups`
+
+After flattening, the mantissas are treated as a matrix of shape `(M, K)` where:
+- The **row dimension** corresponds to the element index within a group.
+- The **column dimension** corresponds to the group index (and thus the shared exponent index).
+
+The CTA (thread block) uses a tiler:
+- `cta_tiler = (BLK_M, BLK_K)`
+and a block coordinate:
+- `cta_coord = (blockIdx.x, blockIdx.y)`
+
+`local_tile(mX, cta_tiler, cta_coord)` selects the rectangular sub-tensor owned by the CTA:
+
+- Rows: `blockIdx.x * BLK_M ... blockIdx.x * BLK_M + BLK_M - 1`
+- Cols: `blockIdx.y * BLK_K ... blockIdx.y * BLK_K + BLK_K - 1`
+
+Thus, the global `(M, K)` matrix is decomposed into `(BLK_M × BLK_K)` tiles, each assigned to one CTA. The output tensor `mY` is tiled identically.
+
+The shared exponent vector is tiled only along the group dimension (K). Each CTA loads the `BLK_K` exponents associated with the group-columns it processes, ensuring that all elements in a given column share the same exponent during reconstruction.
+
+---
+
+### Question: How does `layout_sX` partition threads for computation? (CUTE `local_partition`)
+
+Within a CTA, CUTE uses a thread layout to map threads to elements of the CTA tile. The kernel constructs a 2D thread layout:
+
+- `layout_tX = (thd_m, thd_k)`
+- `dimBlock = thd_m * thd_k`
+
+In the configuration used by the kernel, `thd_m = BLK_M` and `thd_k = BLK_K`, so the block contains `BLK_M * BLK_K` threads. This makes the thread layout isomorphic to the tile shape: each thread corresponds to a unique logical `(m, k)` position in the CTA tile.
+
+CUTE then creates per-thread views using `local_partition`:
+- `tXgX = local_partition(gX, layout_tX, threadIdx.x)` (thread view of global tile)
+- `tXsX = local_partition(sX, layout_sX, threadIdx.x)` (thread view of shared-memory tile)
+
+This mapping enables:
+- **Elementwise cooperative loading**: each thread loads its assigned element from global memory into shared memory (guarded by predication on boundary tiles).
+- **Elementwise reconstruction**: each thread reconstructs BF16 values for its assigned element(s), reusing the shared exponent corresponding to the tile column.
+- **Elementwise cooperative storing**: each thread writes its reconstructed output back to global memory (again predicated on bounds).
+
+Predication is implemented by partitioning an identity tensor through the same layout and comparing coordinates against the valid tile extents. This ensures that partial tiles at tensor boundaries do not issue out-of-bounds global memory accesses.
+
+A key property is exponent reuse: the exponent index is derived from the K-coordinate (group column). Because threads are laid out across `(m, k)`, all threads with the same `k` (column) reuse the same shared exponent, matching MXINT’s group semantics.
+
+---
+
+### Summary
+
+The MXINT8 dequantisation kernel combines:
+- **Bit-level reconstruction** (sign/exponent/fraction packing plus a region-based bias correction),
+- **Block tiling at the CTA level** (`cta_tiler` via `local_tile`), and
+- **Thread-to-element mapping within a tile** (`layout_*` via `local_partition`),
+
+to minimise global memory traffic, maximise exponent reuse, and ensure correct boundary handling via predication. This illustrates how numerical format design (shared micro-exponents) and GPU execution strategy (tiling + cooperative copy) co-determine performance in custom low-level kernels.
+
+---
+
+## Part E – Empirical Evaluation
+
+This section evaluates the MXINT8 dequantisation kernel empirically, focusing on:
+(i) latency characteristics on CPU versus GPU, and
+(ii) realised GPU memory savings when MXINT8 is applied to a real Transformer model.
+
+---
+
+### Latency Profiling: CPU vs GPU Dequantisation
+
+We benchmarked the MXINT8 dequantisation kernel using the provided test suite
+(`test_ext_dequantize1d_latency`), which compares the host reference
+implementation against the CUDA kernel across a range of tensor sizes and
+group sizes.
+
+#### Observed performance regimes
+
+| Tensor size | Relative performance | Interpretation |
+|------------|----------------------|----------------|
+| Small      | GPU slower than CPU  | Kernel launch and synchronization overhead dominate |
+| Large      | GPU significantly faster | Memory throughput and bandwidth dominate |
+
+For small tensors (e.g. \(m = 1024\)), GPU execution is slower than the CPU
+implementation. In this regime, the fixed cost of kernel launch, synchronization,
+and dispatch outweighs any benefit from parallel execution.
+
+As tensor size increases (e.g. \(m \ge 2{,}097{,}152\)), the GPU implementation
+becomes orders of magnitude faster than the CPU version. In this regime, kernel
+launch overhead is amortised, and performance is dominated by sustained memory
+bandwidth rather than arithmetic complexity.
+
+#### Interpretation
+
+The MXINT8 dequantisation kernel is primarily **memory-bandwidth bound**. Once
+sufficient data is available to saturate device memory throughput, the GPU’s
+parallel memory system enables substantially higher throughput than the CPU.
+Group size has a secondary effect, as the kernel remains dominated by global
+memory traffic rather than computation.
+
+---
+
+### GPU Memory Savings in a Real Model
+
+To evaluate the practical impact of MXINT8 quantisation, we applied the
+`QLinearPacked` layer to a real Transformer-based emotion classification model
+and measured peak GPU memory usage during inference.
+
+**Experimental setup**
+- GPU: NVIDIA GeForce RTX 2050 (4 GB)
+- Model: `AnkitAI/deberta-v3-small-base-emotions-classifier`
+- Precision: FP32 baseline vs MXINT8 weight-only quantisation
+- Mode: `eval()` with `torch.no_grad()`
+
+#### Peak memory usage
+
+| Model variant | Peak GPU memory | Reduction |
+|--------------|------------------|------------|
+| FP32         | 559.94 MB        | —          |
+| MXINT8       | 445.50 MB        | 20.4%      |
+
+Both models produced identical predicted labels and very similar top-3 logits,
+indicating that MXINT8 compression did not materially affect inference accuracy
+for this example.
+
+---
+
+### Question: Why is the observed memory saving not the theoretical 74.2%?
+
+The commonly cited theoretical reduction for MXINT8 weight storage,
+
+$\frac{32 - (8 + 8/32)}{32} = 74.2\%$
+
+represents an **upper bound** under idealised assumptions. In practice, peak GPU
+memory usage reflects far more than persistent weight storage. The observed
+reduction (~20%) is lower due to several factors:
+
+1. **Activations and intermediate tensors remain high precision**  
+   Even during inference, embeddings, attention intermediates, and MLP
+   activations are allocated in FP16/FP32. These tensors dominate peak memory
+   usage and are unaffected by weight-only quantisation.
+
+2. **Not all parameters are quantised**  
+   Only `Linear` layers are replaced with MXINT8 variants. Components such as
+   embeddings, LayerNorms, biases, and the classifier head remain unquantised and
+   continue to consume FP32 memory.
+
+3. **MXINT storage introduces real overheads**  
+   Shared exponents must be stored explicitly, and packed layouts introduce
+   alignment and padding overheads that reduce the effective compression ratio.
+
+4. **CUDA allocator behaviour affects peak measurements**  
+   PyTorch reports peak allocated memory, which includes allocator caching,
+   fragmentation, and temporary buffers. Peak memory does not scale linearly with
+   parameter size alone.
+
+#### Interpretation
+
+The theoretical 74.2% reduction applies only to isolated weight storage.
+In a realistic inference workload, peak GPU memory reflects activations,
+temporary buffers, unquantised layers, and allocator effects. Consequently, the
+observed ~20% reduction is expected and still represents a meaningful memory
+saving achieved without changing model predictions.
+
+---
+
+### Conclusion
+
+This lab demonstrates that the most substantial performance improvements in deep
+learning systems arise from **algorithmic restructuring and hardware-aware
+design**, rather than compiler automation alone.
+
+- `torch.compile` provides convenient steady-state speedups but introduces
+  unavoidable cold-start overhead.
+- Kernel fusion (e.g. FlashAttention) reduces memory traffic by eliminating
+  intermediate tensor materialisation.
+- Custom kernels are essential for extracting the full benefit of specialised
+  numerical formats such as MXINT8.
+- Peak GPU memory usage reflects the entire execution context, not just parameter
+  storage.
+
+Accurate benchmarking and systems-level reasoning are therefore essential to
+correctly interpret performance results.
+
+---
+
+### Key Takeaways
+
+- Compilation overhead must be amortised to realise benefits from
+  `torch.compile`.
+- Kernel fusion improves performance primarily by reducing memory movement.
+- Specialised numerical formats require custom kernels to be effective.
+- Theoretical compression ratios overestimate real peak memory savings.
+- Performance optimisation must be evaluated in realistic system contexts.
+
+
+
+
+---
+
+
+#### References
+
+[1] PyTorch Documentation. *torch.compile End-to-End Tutorial*.  
+https://docs.pytorch.org/tutorials/intermediate/torch_compile_full_example.html

@@ -20,13 +20,63 @@
 
 ## Lab 1 – Quantisation and Pruning Fundamentals
 
-### Setup
+### Overview
+We investigate how we can make our models more efficient by quantising and pruning. These are common compression techniques used to reduce memory and compute costs. <br>
+- Quantisation reduces the numerical precision used to represent weights and activations. 
+- Sparsity refers to the number of model parameters that are set to zero and so do not contribute to computation.
 
-### Results
+### Quantisation
+We focus on fixed-point quantisation in this lab. This is where floating-point weights and activations are represented using a limited number of bits. We compare Post-Training Quantisation (PTQ) and Quantisation-Aware Training (QAT). PTQ applies quantisation after training without modifying the model. QAT is when quantisation effects are simulated during training to allow the model to adapt. We sweep bit-widths from 4 to 32 showing how reduced precision degrades accuracy and how QAT can recover performance at lower bit-widths compared to PTQ. <br>
 
-### Observations
+QAT introduces quantisation effects during training, then we retrain the model for one epoch. This allows the models parameters to be adjusted to the noise quantisation may create. 
+Quantisation width is the number of bits used to represent a number. We vary the width and evaluate how this affects the models accuracy. An increased quantisation width will clearly increase the accuracy as there are fewer rounding errors and therefore higher precision. Here we compare the bit lengths `[4, 8, 16, 32]` for both PTQ and QAT.
 
-### Conclusion
+![](images/Lab1-Quantisation-Results.png)
+*How quantisation width affects model accuracy for Post-Training Quantisation (PTQ) and Quantisation-Aware Training (QAT)*
+
+We see the largest difference between PTQ and QAT at lower quantisation widths. QAT has a much higher accuracy at 0.79256 with 4 bit-width compared to PTQ's 0.67572 accuracy. In general QAT performs better than PTQ at every bit width showing that it is a better and more resilient quantisation method. 
+
+The fractional width is derived from the total bit-width while keeping the integer width approximately fixed in order to preserve dynamic range and ensure that accuracy changes primarily reflect quantisation precision rather than overflow effects.
+
+```python
+def make_quantization_config(w: int):
+    frac_width = max(4, w-2)
+    return {
+        "by": "type",
+        "default": {
+            "config": {
+                "name": None,
+            }
+        },
+        "linear": {
+            "config": {
+                "name": "integer",
+                # data
+                "data_in_width": w,
+                "data_in_frac_width": frac_width,
+                # weight
+                "weight_width": w,
+                "weight_frac_width": frac_width,
+                # bias
+                "bias_width": w,
+                "bias_frac_width": frac_width,
+            }
+        },
+    }
+```
+### Pruning
+Pruning is a method for increasing model sparsity by removing less important parameters. Higher sparsity corresponds to a larger fraction of weights being removed and we vary the sparsity level in this part of the lab. We can evaluate using random pruning, which removes weights at random or L1-norm pruning, which removes weights with the smallest magnitudes. We find that rule based pruning preserves accuracy better than random pruning, especially as we try and push our sparsity to a high level. <br>
+
+We enforce the same sparsity across both weights and activations, with pruning performed locally so that each tensor is pruned independently based on its own metadata. Sparsity is swept from 0.1 to 0.9 using fine granularity to identify the point at which accuracy degrades sharply
+
+Pruning has a much higher computational demand compared to quantisation. To combat any error and repeated execution caused by this, we added checkpoints after each run, a cooldown period between each run and explicit memory clean up.
+
+All pruning experiments include one epoch of post-pruning fine-tuning as retraining is generally required to recover accuracy after parameters have been removed, much like in QAT.
+
+![](images/Lab1-Pruning-Results.png)
+*How Random and L1-Pruning affect model evaluation accuracy at a sweeping range of sparsity levels.*
+
+Pruning is applied incrementally at each sparsity level, and the pruned model is evaluated on the IMDb dataset to measure the highest model accuracy. The results show that accuracy decreases as sparsity increases for both methods, but L1-norm pruning consistently preserves accuracy better than random pruning, particularly at higher sparsity levels. This gap widens as sparsity approaches extreme values, demonstrating that structured pruning strategies are more robust when aggressively compressing the model. Here pruning effects seem to be more gradual than quantisation effects observed in Lab 1.
 
 ---
 
